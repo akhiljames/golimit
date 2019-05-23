@@ -1,30 +1,31 @@
 package golimit
 
 import (
-	"sync"
 	"time"
 )
 
-// Lua script to implement a leaky bucket
-const lua = `
+// the Lua script that implements the Token Bucket Algorithm.
+// bucket.tc represents the token count.
+// bucket.ts represents the timestamp of the last time the bucket was refilled.
+const luaRateLimiter = `
 local key = KEYS[1]
 local interval = tonumber(ARGV[1])
-local quantum = tonumber(ARGV[2])
-local capacity = tonumber(ARGV[3])
-local now = tonumber(ARGV[4])
-local count = tonumber(ARGV[5])
-local bucket = {tc=quantum, ts=now}
+local capacity = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local amount = tonumber(ARGV[4])
+local bucket = {tc=capacity, ts=now}
 local value = redis.call("get", key)
 if value then
   bucket = cjson.decode(value)
 end
-local cycles = math.floor((now - bucket.ts) / interval)
-if cycles > 0 then
-  bucket.tc = math.min(bucket.tc + cycles * quantum, capacity)
-  bucket.ts = bucket.ts + cycles * interval
+local added = math.floor((now - bucket.ts) / interval)
+if added > 0 then
+  bucket.tc = math.min(bucket.tc + added, capacity)
+  bucket.ts = bucket.ts + added * interval
 end
-if bucket.tc >= count then
-  bucket.tc = bucket.tc - count
+if bucket.tc >= amount then
+  bucket.tc = bucket.tc - amount
+  bucket.ts = string.format("%.f", bucket.ts)
   if redis.call("set", key, cjson.encode(bucket)) then
     return 1
   end
@@ -32,63 +33,42 @@ end
 return 0
 `
 
-// Redis interface
-type Redis interface {
-	Eval(script string, keys []string, args ...interface{}) (interface{}, error)
-}
-
-// Bucket struct
-type Bucket struct {
-	Interval time.Duration
-	Quantum  int64
-	Capacity int64
-}
-
-// RateLimiter struct
+// RateLimiter implements the Token Bucket Algorithm.
+// See https://en.wikipedia.org/wiki/Token_bucket.
 type RateLimiter struct {
-	redis Redis
-	key   string
+	baseBucket
 
-	mu     sync.RWMutex
-	bucket *Bucket
+	script *Script
+	key    string
 }
 
-// New RateLimiter
-func New(redis Redis, key string, bucket *Bucket) *RateLimiter {
+// NewRateLimiter returns a new token-bucket rate limiter special for key in redis
+// with the specified bucket configuration.
+func NewRateLimiter(redis Redis, key string, config *Config) *RateLimiter {
 	return &RateLimiter{
-		redis:  redis,
-		key:    key,
-		bucket: bucket,
+		baseBucket: baseBucket{config: config},
+		script:     NewScript(redis, luaRateLimiter),
+		key:        key,
 	}
 }
 
-// SetBucket inits bucket
-func (rl *RateLimiter) SetBucket(bucket *Bucket) {
-	rl.mu.Lock()
-	rl.bucket = bucket
-	rl.mu.Unlock()
-}
+// Take takes amount tokens from the bucket.
+func (b *RateLimiter) Take(amount int64) (bool, error) {
+	config := b.Config()
+	if amount > config.Capacity {
+		return false, nil
+	}
 
-// Take takes count tokens from the bucket stored at rl.key in Redis.
-func (rl *RateLimiter) Take(count int64) (bool, error) {
-	rl.mu.RLock()
-	interval := rl.bucket.Interval
-	quantum := rl.bucket.Quantum
-	capacity := rl.bucket.Capacity
-	rl.mu.RUnlock()
-
-	now := time.Now().Unix()
-	status, err := rl.redis.Eval(
-		lua,
-		[]string{rl.key},
-		int64(interval/time.Second),
-		quantum,
-		capacity,
-		now,
-		count,
+	now := time.Now().UnixNano()
+	result, err := b.script.Run(
+		[]string{b.key},
+		int64(config.Interval/time.Microsecond),
+		config.Capacity,
+		int64(time.Duration(now)/time.Microsecond),
+		amount,
 	)
 	if err != nil {
 		return false, err
 	}
-	return status == int64(1), nil
+	return result == int64(1), nil
 }
