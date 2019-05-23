@@ -1,0 +1,5 @@
+package: github.com/akhiljames/golimit
+import: []
+testImport:
+- package: github.com/go-redis/redis
+  version: ^6.15.3
